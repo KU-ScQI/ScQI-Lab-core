@@ -1,0 +1,18 @@
+name: pre-commit
+
+# PR이 올라올 때와 main에 push될 때 검사합니다.
+# 출력이 안 지워진 노트북이나 대용량 파일이 있으면 업로드를 막습니다.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: pre-commit/action@v3.0.1
