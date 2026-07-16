@@ -20,6 +20,17 @@ from keysight.qcs.quantum import (
     ParametricGate,
 )
 
+from keysight.qcs.variables import Array, Scalar
+
+
+def set_value_at(var, value, index):
+    v = var.value.copy()
+
+    v[index] = value
+
+    var.value = v
+
+
 def load_json(filename):
     with open(filename, "r") as f:
         return json.load(f)
@@ -30,7 +41,7 @@ def validate_json(variables_from_json, qubits, variable_names):
     missing_params = {}
 
     for label in qubits.labels:
-        key = f"qudits_{label}"
+        key = f"q_{label}"
 
         if key not in variables_from_json:
             missing_qudits.append(key)
@@ -59,7 +70,7 @@ def json_to_dataframe(json_data):
         row = {}
 
         # qudit index 추출: "qudits_0" -> 0
-        row["qudit"] = int(qudit_key.split("_")[-1])
+        row["q"] = int(qudit_key.split("_")[-1])
 
         for name, value in params.items():
             if name == "classification_refs":
@@ -75,11 +86,11 @@ def json_to_dataframe(json_data):
     df = pd.DataFrame(rows)
 
     # qudit 순서대로 정렬
-    df = df.sort_values("qudit").reset_index(drop=True)
+    df = df.sort_values("q").reset_index(drop=True)
 
     return df
 
-
+  
 
 def is_missing_value(value):
     """
@@ -118,15 +129,15 @@ def dataframe_to_json(df, filename=None):
     json_data = {}
 
     for _, row in df.iterrows():
-        qudit = int(row["qudit"])
-        qudit_key = f"qudits_{qudit}"
+        qudit = int(row["q"])
+        qudit_key = f"q_{qudit}"
 
         params = {}
         real_refs = {}
         imag_refs = {}
 
         for col in df.columns:
-            if col == "qudit":
+            if col == "q":
                 continue
 
             value = row[col]
@@ -216,7 +227,7 @@ def make_qcs_var(variables_from_json, qubits):
     for name in variable_names:
         values = np.asarray(
             [
-                variables_from_json[f"qudits_{label}"][name]
+                variables_from_json[f"q_{label}"][name]
                 for label in qubit_labels
             ],
             dtype=float,
@@ -234,7 +245,7 @@ def make_qcs_var(variables_from_json, qubits):
     classification_refs = []
 
     for label in qubit_labels:
-        refs = variables_from_json[f"qudits_{label}"]["classification_refs"]
+        refs = variables_from_json[f"q_{label}"]["classification_refs"]
 
         real = np.asarray(refs["real"], dtype=float)
         imag = np.asarray(refs["imag"], dtype=float)
@@ -251,15 +262,26 @@ def make_qcs_var(variables_from_json, qubits):
 
     return qcs_vars
 
+def flattop_env(ramp_frac=0.1, n_edge=32):
+    """
+    Gaussian-edge flattop envelope (times normalized to 0..1.)
+    """
+    s = np.linspace(-2.0, 0.0, n_edge)
+    edge = np.exp(-s**2 / 2.0)
+    times = np.concatenate([np.linspace(0.0, ramp_frac, n_edge),
+                           np.linspace(1.0 - ramp_frac, 1.0, n_edge)])
+    amps = np.concatenate([edge, edge[::-1]])
+    return qcs.ArbitraryEnvelope(times = times, amplitudes = amps)
 
 class MyCalibrationSet(CalibrationSet):
-    def __init__(self, topology, channels, variables):
+    def __init__(self, topology, channels, variables, edge_list = None):
         # Initialize the parent CalibrationSet with the given topology.
         super().__init__(topology)
 
         # Use the first qudit group defined in the topology as the active qubits.
         # For example, this may correspond to labels such as (0, 1, 2).
         self.qubits = topology.qudits[0]
+        self.edge_list = list(edge_list) if edge_list is not None else []
 
         # Register QCS variables in the CalibrationSet.
         #
@@ -298,6 +320,9 @@ class MyCalibrationSet(CalibrationSet):
         # and measurement operation when the calibration set is created.
         self.add_sx()
         self.add_rz()
+        if self.edge_list:
+            self.add_cr()
+        self.add_sx_ef()
         self.add_measurement()
 
     def _get_channel(self, name):
@@ -337,10 +362,43 @@ class MyCalibrationSet(CalibrationSet):
         )
 
         # Register the sx gate in the calibration set.
+        GATES.x90.name='SX'
         self.add_sq_gate(
             "sx",
             GATES.x90,
             x90_pulse,
+            self.qubits,
+            self.xy_awg,
+        )
+
+        return self
+    
+    def add_sy(self):
+        """
+        Add the sy gate using the x90 pulse parameters registered by add_variable and adding 90 degree phase.
+
+        Required variables include:
+        sx_ramp, sx_dur, sx_amp, sx_freq
+        """
+      
+        # Build a flattop RF waveform for the x90 pulse.
+        # Total duration = rise + hold + fall.
+        y90_pulse = RFWaveform.create_rf_flattop(
+            rise_duration=self.variables.sx_ramp,
+            hold_duration=self.variables.sx_dur - 2 * self.variables.sx_ramp,
+            fall_duration=self.variables.sx_ramp,
+            envelope=GaussianEnvelope(),
+            amplitude=self.variables.sx_amp,
+            frequency=self.variables.sx_freq,
+            instantaneous_phase=np.pi/2
+        )
+
+        # Register the sx gate in the calibration set.
+        GATES.y90.name='SY'
+        self.add_sq_gate(
+            "sy",
+            GATES.y90,
+            y90_pulse,
             self.qubits,
             self.xy_awg,
         )
@@ -362,13 +420,143 @@ class MyCalibrationSet(CalibrationSet):
         ####################################################################################
 
         self.add_sq_gate(
-            "virtual_z",
+            "rz",
             ParameterizedGate(PAULIS.rz, self.variables.phi),
             PhaseIncrement(self.variables.phi),
             self.qubits,
             self.xy_awg,
         )
 
+    def add_cr(self, edge_list=None, name="cr"):
+        """
+        Add the cross-resonance gate on the given directed edges.
+
+        Required variables include:
+        cr_dur, cr_amp.
+        
+        Need to be called after add_sx().
+        """
+
+        if "sx" not in self.linkers:
+            raise RuntimeError("add_cr requires the 'sx' linker: call add_sx() first.")
+        
+        edges = edge_list if edge_list is not None else self.edge_list
+        if not edges:
+            raise RuntimeError("No edges given: pass edge_list as an argument or set self.edge_list.")
+        pairs = self.qubits.make_connectivity(edges)
+        n_edges = len(edges)
+
+        zx = PAULIS.sigma_z & PAULIS.sigma_x
+        cr_gate = ParametricGate([zx], ["beta"])
+        angles = Array(name = "beta", shape = (n_edges,), dtype = float)
+        cr_param_gate = ParameterizedGate(cr_gate, angles)
+
+        target_idx = [edge[1] for edge in edges]
+        cr_freq = Array("cr_target_freq", dtype=float,
+                        value=[self.variables.sx_freq.value[i] for i in target_idx])
+        # in case of changing sx_freq, cr_freq should be changed manually, too.
+
+        control_pulse = RFWaveform(
+            self.variables.cr_dur,
+            flattop_env(ramp_frac=0.1),
+            self.variables.cr_amp,
+            cr_freq,
+        )
+        self.add_cr_gate(
+            cr_param_gate,
+            pairs,
+            sq_linker="sx",
+            control_waveform=control_pulse,   
+            name = name, 
+        )
+        return self    
+
+    def add_sizzle(self, edge_list=None, name="sizzle"):
+        """
+        Add the siZZle gate on the given directed edges.
+        Required variables include:
+        sizzle_dur, sizzle_freq, sizzle_c_amp, sizzle_t_amp, sizzle_phase.
+        sizzle_phase is the phase of the target drive relative to the control drive.
+        
+        Need to be called after add_sx().
+
+        example usage: 
+            prog.add_parametric_gate(
+                cal.sizzle_gate.gate, [cal.sizzle_gate.parameters[0]], pair
+                )
+        
+        """
+
+        if "sx" not in self.linkers:
+            raise RuntimeError("add_sizzle requires the 'sx' linker: call add_sx() first.")
+
+        edges = edge_list if edge_list is not None else self.edge_list
+        if not edges:
+            raise RuntimeError("No edges given: pass edge_list as an argument or set self.edge_list.")
+        pairs = self.qubits.make_connectivity(edges)
+        n_edges = len(edges)
+
+        zz = PAULIS.sigma_z & PAULIS.sigma_z
+        sizzle_gate = ParametricGate([zz], ["beta"])
+        angles = Array(name="sizzle_beta", shape=(n_edges,), dtype=float)
+        sizzle_param_gate = ParameterizedGate(sizzle_gate, angles)
+
+        control_idx = [edge[0] for edge in edges]
+        target_idx = [edge[1] for edge in edges]
+
+        control_pulse = RFWaveform(
+            self.variables.sizzle_dur,
+            flattop_env(ramp_frac=0.1),
+            self.variables.sizzle_c_amp,
+            self.variables.sizzle_freq,
+        )
+
+        target_pulse = RFWaveform(
+            self.variables.sizzle_dur,
+            flattop_env(ramp_frac=0.1),
+            self.variables.sizzle_t_amp,
+            self.variables.sizzle_freq,
+            instantaneous_phase=self.variables.sizzle_phase,
+        )
+
+        sizzle_prog = qcs.Program()
+        sizzle_prog.add_waveform(control_pulse, self.xy_awg[control_idx])
+        sizzle_prog.add_waveform(target_pulse, self.xy_awg[target_idx])
+
+        sizzle_linker = qcs.ParameterizedLinker(sizzle_param_gate, pairs, sizzle_prog)
+
+        self.add_linker(name, sizzle_linker)
+        return self
+
+    def add_sx_ef(self):
+        """
+        Add the sx_ef gate using the x90 pulse parameters registered by add_variable.
+
+        Required variables include:
+        sx_ef_ramp, sx_ef_dur, sx_ef_amp, sx_ef_freq
+        """
+      
+        # Build a flattop RF waveform for the x90 pulse.
+        # Total duration = rise + hold + fall.
+        x90_ef_pulse = RFWaveform.create_rf_flattop(
+            rise_duration=self.variables.sx_ef_ramp,
+            hold_duration=self.variables.sx_ef_dur - 2 * self.variables.sx_ef_ramp,
+            fall_duration=self.variables.sx_ef_ramp,
+            envelope=GaussianEnvelope(),
+            amplitude=self.variables.sx_ef_amp,
+            frequency=self.variables.sx_ef_freq,
+        )
+
+        # Register the sx gate in the calibration set.
+        self.add_sq_gate(
+            "sx_ef",
+            qcs.Gate([[1,0],[0,1]],name='SXef'),
+            x90_ef_pulse,
+            self.qubits,
+            self.xy_awg,
+        )
+
+        return self
 
     def add_measurement(self):
         """
@@ -408,6 +596,7 @@ class MyCalibrationSet(CalibrationSet):
         replacement_program.add_waveform(
             readout_pulse,
             self.readout_awg,
+            new_layer=True,
             pre_delay=self.variables.ro_delay,
         )
 
